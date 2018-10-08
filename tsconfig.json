@@ -1,0 +1,23 @@
+{
+    "compileOnSave": true,
+    "compilerOptions": {
+        "allowSyntheticDefaultImports": true,
+        "module": "commonjs",
+        "target": "es2017",
+        "lib": [
+            "es2017"
+        ],
+        "declaration": false,
+        "noImplicitAny": false,
+        "removeComments": true,
+        "sourceMap": true
+    },
+    "include": [
+        "src/**/*.ts",
+        "features/**/*.ts",
+        "test/**/*.ts"
+    ],
+    "atom": {
+        "rewriteTsconfig": true
+    }
+}

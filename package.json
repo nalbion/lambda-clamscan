@@ -1,0 +1,25 @@
+{
+    "name": "lambda-clamscan",
+    "version": "0.0.1",
+    "description": "Lambda function which scans files for viruses",
+    "homepage": "https://github.com/nalbion/lambda-clamscan",
+    "author": "Nicholas Albion <nalbion@yahoo.com>",
+    "license": "Apache License 2.0",
+    "keywords": [
+        "clamav",
+        "S3",
+	"lambda"
+    ],
+    "scripts": {
+    },
+    "repository": "https://github.com/nalbion/lambda-clamscan.git",
+    "devDependencies": {
+        "@types/node": "4.2.19",
+        "aws-sdk": "2.30.0",
+        "ts-node": "^7.0.0",
+        "tslint": "4.5.0",
+        "tslint-eslint-rules": "3.5.1",
+        "typescript": "2.1.4"
+    }
+}
+
