@@ -1,5 +1,6 @@
 import {ClamScanService} from '../utils/clam-scan-service';
 import {S3Utils, S3Event} from '../../node_modules/lambda-node-utils/src/s3-utils';
+import {CloudWatch} from 'aws-sdk';
 import {saveItem, generateDynamoDbItem} from '../../node_modules/lambda-node-utils/src/dynamodb-utils';
 import {FileUploadDynamoDbMetaData, FileUploadS3MetaData} from '../file-upload-metadata';
 
@@ -24,7 +25,7 @@ export class S3ObjectCreatedHandler {
     private s3Utils: S3Utils;
     private dynamoDbTableName: string;
 
-    constructor(private envConfig: any, private s3: AWS.S3, private dynamoDb: AWS.DynamoDB) {
+    constructor(private envConfig: any, private s3: AWS.S3, private dynamoDb: AWS.DynamoDB, private cloudwatch: CloudWatch) {
         this.s3Utils = new S3Utils(s3);
         this.clamScanService = new ClamScanService(envConfig.clamAvHost, s3, this.s3Utils);
         this.dynamoDbTableName = envConfig.dynamoDbTableName;
@@ -36,11 +37,8 @@ export class S3ObjectCreatedHandler {
      * @returns {Promise<any>}
      */
     async handleEvent(event: S3Event) {
-        console.info('--------------------handleEvent:', event);
-
         let promisedUpdateFromS3;
         if (!(event as any).skipS3Download) {
-console.info('updating from S3...');
             promisedUpdateFromS3 = this.clamScanService.updateDefsFromS3(this.envConfig.s3Bucket).then(async results => {
                 if (results === 0) {
                     console.info('No virus definitions downloaded from S3, run freshclam & update S3 first...');
@@ -55,9 +53,9 @@ console.info('updating from S3...');
         }
 
         if (event.Records) {
-            console.info('S3ObjectCreatedHandler.handle()', event.Records.length, 'events');
+            console.info('S3ObjectCreatedHandler.handle() -', event.Records.length, 'events');
 
-            return Promise.all(event.Records.map(async (record) => {
+            await Promise.all(event.Records.map(async (record) => {
                 let bucket = record.s3.bucket.name,
                     key = record.s3.object.key,
                     result;
@@ -68,6 +66,7 @@ console.info('updating from S3...');
                     result = await this.initMetadata(bucket, key);
                     await this.updateUploadStatus(result, 'processing');
                     await this.processUploadedFile(bucket, key, promisedUpdateFromS3, result);
+                    await this.logCloudWatchMetrics(result);
                     await this.processObjectCreatedResult(result);
                 } catch (err) {
                     console.info('Failed to process S3 record:', err);
@@ -86,8 +85,6 @@ console.info('updating from S3...');
             await this.clamScanService.updateDefsFromFreshclam();
             await this.clamScanService.updateDefsToS3(this.envConfig.s3Bucket);
         }
-
-console.info('--------end of handleEvent');
     }
 
     private async initMetadata(bucket: string, key: string): Promise<ObjectCreatedResult> {
@@ -144,7 +141,7 @@ console.info('--------end of handleEvent');
             console.info(key, 'must be less than 3GB');
             await this.deleteFileWithError(result, 'File must be less than 3GB');
         } else if (fileSize <= MAXIMUM_SCANNABLE_SIZE) {
-            console.info(key, 'must be scanned for viruses', promisedUpdateFromS3);
+            console.info(key, 'must be scanned for viruses');
             await promisedUpdateFromS3;
             let virusName = await this.scanForVirus(bucket, key, fileSize);
             result.virusScanResult = virusName;
@@ -154,12 +151,55 @@ console.info('--------end of handleEvent');
         return result;
     }
 
+    private logCloudWatchMetrics(result: ObjectCreatedResult): any | Promise<any> {
+        return new Promise(resolve => {
+            const now = new Date();
+            let fileName = result.metadata['qqfilename'];
+            let scanResult: string;
+            switch (result.virusScanResult as any) {
+                case 0:
+                case null:
+                case undefined:
+                    scanResult = 'No virus detected';
+                    break;
+                case false:
+                    scanResult = 'Too big to scan';
+                    break;
+                default:
+                    scanResult = '' + result.virusScanResult;
+            }
+
+            this.cloudwatch.putMetricData({
+                Namespace: 'FileUpload',
+                MetricData: [{
+                    Timestamp: now,
+                    MetricName: 'Virus Scan',
+                    Value: 1,
+                    Unit: 'None',
+                    Dimensions: [{
+                        Name: 'Virus Scan Result',
+                        Value: scanResult
+                    }]
+                }, {
+                    Timestamp: now,
+                    MetricName: 'File Size',
+                    Value: result.metadata['file-size'],
+                    Unit: 'Bytes',
+                    Dimensions: [{
+                        Name: 'File Type',
+                        Value: fileName.substr(fileName.lastIndexOf('.'))
+                    }]
+                }]
+            }, resolve);
+        });
+    }
+
     private processObjectCreatedResult(result: ObjectCreatedResult): any | Promise<any> {
         if (result.virusScanResult) {
             console.info('Virus found:', result.virusScanResult);
             result.dynamoDbRecord.virus_status = 'infected';
 
-            return this.deleteFileWithError(result, 'File contains a virus');
+            return this.deleteFileWithError(result, 'File contains a virus', false);
         } else {
             if (result.virusScanResult !== false) {
                 console.info('No virus detected');
@@ -189,14 +229,16 @@ console.info('--------end of handleEvent');
         return objectCreatedResult;
     }
 
-    private deleteFileWithError(result: ObjectCreatedResult, error: string) {
+    private deleteFileWithError(result: ObjectCreatedResult, error: string, throwError?: boolean) {
         console.info('Deleting file', result.key, 'because of error:', error);
         return Promise.all([
             this.updateUploadStatus(result, 'error', error),
             this.s3Utils.deleteFile(result.bucket, result.key)
         ]).then(() => {
             // nothing else to do
-            throw error;
+            if (throwError !== false) {
+                throw error;
+            }
         });
     }
 }

@@ -41,9 +41,10 @@ export class ClamScanService {
      * @param fileSize
      * @returns {IThenable<T>} resolves with the name of the virus if found, otherwise null for a clean file
      */
-     scanS3ObjectForVirus(bucket: string, key: string, fileSize?: number): Promise<string> {
+    scanS3ObjectForVirus(bucket: string, key: string, fileSize?: number): Promise<string> {
         console.info('Scanning', key, 'for viruses...');
-        return this.downloadFile(bucket, key, fileSize).then(localPath => this.scanFile(localPath));
+        return this.downloadFile(bucket, key, fileSize)
+                    .then(ClamScanService.scanFile);
     }
 
     /**
@@ -135,10 +136,14 @@ export class ClamScanService {
                                         [
                                             '--config-file=/var/task/lib/freshclam.conf',
                                             '-v',
-                                            '-u', require('os').userInfo().uid,
+                                            // '--debug',
+                                            // '--stdout',
+                                            //'-u', require('os').userInfo().uid,
                                             '--datadir=' + path
                                         ],
-                                        {stdio: 'inherit'});
+                                        {
+                                            stdio: 'inherit'
+                                        });
 
                 freshclam.on('error', reject);
                 freshclam.on('exit', function(code, signal) {
@@ -159,10 +164,12 @@ export class ClamScanService {
     }
 
     /**
+     * Scanning a 200MB file takes about 15-50 seconds (with 2GB RAM allocated on Lambda).
+     * Scanning a 200MB file uses up to 1053 MB.
      * @param {string} path
      * @returns {Promise<any>} resolves with 1 if file is infected
      */
-    scanFile(path: string) {
+    static scanFile(path: string) {
         return new Promise(function(resolve, reject) {
             if (!fs.existsSync('/tmp/clamscan')) {
                 console.info('installing clamscan...');
@@ -175,25 +182,59 @@ export class ClamScanService {
             }
 
             console.info('Scanning:', path);
-            const slash = AV_DEFINITION_PATH.lastIndexOf('/');
-            const defDir = AV_DEFINITION_PATH.substr(0, slash);
 
-            console.info(defDir, 'contents:', fs.readdirSync(defDir));
+            const clamscan = spawn('/tmp/clamscan',
+                                    [
+                                        // '-v',
+                                        // '-a',
+                                        // '--debug',
+                                        '--stdout',
+                                        '--no-summary',
+                                        '-o',
+                                        // '--tempdir=/tmp',
+                                        '--max-filesize=200000',
+                                        '--max-scansize=200000',
+                                        '--disable-cache',
+                                        '-d', AV_DEFINITION_PATH,
+                                        path
+                                    ],
+                                    {
+                                        // env: process.env,
+                                        // detached: false,
+                                        // stdio: 'inherit'
+                                    });
+            let result: string;
 
-            const clamscan = spawn(//'ls', ['-al', '/tmp/clamav_defs'],
-                                    '/tmp/clamscan',
-                                    ['-v', '-a', '--stdout', '--tempdir=/tmp', '-d ' + defDir, path],
-                                    {stdio: 'inherit'});
             clamscan.on('error', reject);
+            clamscan.on('message', message => {
+                console.info('clamscan message:', message);
+            });
+            clamscan.stdout.on('data', (data: Buffer) => {
+                console.info('clamscan data:', data.toString());
+                const match = data.toString().trim().match(/.*: (.+) FOUND$/);
+                console.info('match:', match);
+                if (match) {
+                    result = match[1];
+                }
+            });
+            clamscan.stderr.on('data', (data: Buffer) => {
+                console.info('clamscan err:', data.toString());
+            });
             clamscan.on('exit', function(code, signal) {
                 if (code === 1) {
-                    return reject('Virus detected');
+                    console.info('Virus detected:', result);
+                    return resolve(result || 'Virus');
                 } else if (code > 0 || signal) {
                     return reject(code || signal);
                 }
-                console.info('clamscan close:', code);
                 resolve(code);
             });
+        }).then(result => {
+            fs.unlinkSync(path);
+            return result;
+        }).catch(err => {
+            fs.unlinkSync(path);
+            throw err;
         });
     }
 
@@ -344,117 +385,4 @@ export class ClamScanService {
             }
         });
     }
-        /*return new Promise((resolve, reject) => {
-            let params = {Bucket: bucket, Key: key, Range: null};
-
-            let doScan = (dataStream: NodeJS.ReadableStream, onConnect: (socket: Socket) => void) => {
-                this.scanDataForVirus(dataStream, onConnect, (err, result) => {
-                    if (err) {
-                        console.info('error:', err);
-                        reject(err);
-                    } else {
-                        // console.info('done!', result);
-                        resolve(result);
-                    }
-                });
-            };
-
-            if (fileSize && fileSize > CHUNK_SIZE) {
-                console.info('File size:', fileSize, '> CHUNK_SIZE (' + CHUNK_SIZE + ')');
-                let dataStream = new stream.PassThrough({highWaterMark: CHUNK_SIZE});
-
-                let readNextChunk = (start: number) => {
-                    // Range: 'bytes=0-1' gives the first 2 bytes
-                    let end = Math.min(start + CHUNK_SIZE, fileSize) - 1;
-                    params.Range = 'bytes=' + start + '-' + end;
-                    console.info('Reading from S3', params.Range, '(inclusive)');
-
-                    this.s3.getObject(params, (err: Error, data) => {
-                        if (err) {
-                            console.info('Failed to read', key, start, end);
-                            reject(err);
-                        } else {
-                            dataStream.write(data.Body);
-                            if (end + 1 >= fileSize) {
-                                // console.info('Finished sending chunks');
-                                dataStream.end();
-                            } else {
-                                readNextChunk(end + 1);
-                            }
-                        }
-                    });
-                };
-
-                doScan(dataStream, () => {
-                    readNextChunk(0);
-                });
-            } else {
-                this.s3.getObject(params, (err: Error, data) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        const dataStream = this.prepareDataForClamAv(data.Body);
-                        // dataStream.pause();
-                        doScan(dataStream, () => {
-                            // dataStream.resume();
-                            // dataStream.end()
-                        });
-                    }
-                });
-            }
-        });
-    }*/
-
-    /* *
-     * According to the AWS docs, data.Body can be one of:
-     *   Buffer, Typed Array, Blob, String, ReadableStream.
-     * ClamAvScanner.scan() requires a string or ReadableStream
-     * /
-    prepareDataForClamAv(data: Buffer|Array<any>|Object|string|NodeJS.ReadableStream): NodeJS.ReadableStream {
-        if (data.constructor != Buffer && typeof data != 'string') {
-            // console.info('data is already a readable stream');
-            return data as NodeJS.ReadableStream;
-        } else {
-            // console.info('need to create a stream:', typeof data, data.constructor == Buffer);
-            // Wrap the Buffer with a stream
-            let dataStream = new stream.PassThrough();
-            // setTimeout(() => {
-// console.info('no delay - this should fail sometimes');
-// TODO: don't write (def not end) until socket connected
-                dataStream.end(data);
-
-            /*let dataStream = new stream.Readable({
-                read(size) {
-                    console.info('read(', size,'), from', this._offset, 'we have', this._length);
-                    // return data;
-
-                    if ( this._offset < this._length ) {
-                        this.push(this._source.slice(this._offset, (this._offset + size)));
-                        this._offset += size;
-                    }
-
-                    // If we've consumed the entire source buffer, close the readable stream.
-                    if ( this._offset >= this._length ) {
-                        this.push(null);
-                    }
-                }
-            });
-            dataStream._source = data as Buffer;
-            dataStream._offset = 0;
-            dataStream._length = (data as Buffer).length;* /
-
-            // }, 1000);
-            return dataStream;
-        }
-    }
-
-    scanDataForVirus(data: NodeJS.ReadableStream, onConnect: (socket: Socket) => void, callback: (err: Error, result?: string) => void) {
-        let scanner: ClamAvScanner = clamav.createScanner(3310, this.clamAvHost);
-        const socket = scanner.scan(data, (err, object, result) => {
-            console.info('scanned:', err, /*object, * /result);
-            callback(err, result);
-        });
-
-        socket.on('connect', onConnect);
-    }*/
 }
